@@ -11,6 +11,8 @@ from django.http import JsonResponse, HttpResponse
 import base64
 from datetime import datetime
 from django.conf import settings
+from django.utils import timezone
+from datetime import timedelta
 
 
 # Create your views here.
@@ -96,7 +98,7 @@ def mpesa_payment(request, package_id):
                             "PartyA":format_phone_number(phonenumber),    
                             "PartyB":shortcode,    
                             "PhoneNumber": format_phone_number(phonenumber),    
-                            "CallBackURL": "https://0e6892e0ad3b.ngrok-free.app/callback/{package_id}",  #kumbuka kutumia ngrok url  
+                            "CallBackURL": "https://11017bbcb974.ngrok-free.app/callback/{package_id}",  #kumbuka kutumia ngrok url  
                             "AccountReference":"Test",    
                             "TransactionDesc":"Test"
                             }
@@ -106,10 +108,16 @@ def mpesa_payment(request, package_id):
         print(response.text.encode('utf8'))
         safaricom_response = response.json()
         checkout_id = safaricom_response.get('CheckoutRequestID')
+        
 
         Payment.objects.create(phonenumber = phonenumber,checkoutrequestid = checkout_id, amountpaid = amount)
+
+        if checkout_id and len(checkout_id)>8:
+            masked_checkout_id = checkout_id[:4] + "****" + checkout_id[-4:]
+        else:
+            masked_checkout_id = "invalid_checkout_id"
         the_response = JsonResponse({"message": "STK push initiated", "safaricom_response": response.json()})
-        return render(request, "waiting.html", {"checkout_id": checkout_id})
+        return render(request, "waiting.html", {"checkout_id": masked_checkout_id})
       
        
         
@@ -122,22 +130,27 @@ def callback(request,package_id):
         mpesa_response = json.loads(request.body)
         checkout_id =  mpesa_response['Body']['stkCallback']['CheckoutRequestID']
         result_code = mpesa_response['Body']['stkCallback']['ResultCode']
+
         try:
             truepayment = Payment.objects.get(checkoutrequestid=checkout_id)
-            truepayment.confirmed = True
-            truepayment.save()
-            print("truepayment:",truepayment)
+            
            
         except Payment.DoesNotExist:
             return HttpResponse("Payment not found", status=404)
+        
         if result_code != 0:
             print("payment failed")
             return render(request,'index.html')
         else:
+            truepayment.confirmed = True
+            duration_obj = get_object_or_404(Amount, id = package_id)
+            expiry_time = timezone.now()+ timedelta(minutes=duration_obj.duration)
             codeuse = generete_code()
-            duration = get_object_or_404(Amount, id= package_id)
-            voucher = Voucher.objects.create(code=codeuse, duration=duration)
-            mikrotic_router_connection(codeuse,voucher.duration)
+            
+            voucher = Voucher.objects.create(code=codeuse, duration=duration_obj, valid_until=expiry_time)
+            truepayment.voucher = voucher
+            truepayment.save()
+            mikrotic_router_connection(voucher.code,f"{duration_obj.duration}m")
 
             
 
@@ -145,30 +158,47 @@ def callback(request,package_id):
             return render(request,"paymentsuccess")
 
           
-def mikrotic_router_connection(username, duration):
+def mikrotic_router_connection(voucher_code, duration):
     
     ip = settings.IP
-    username = settings.USERNAME
-    password = settings.PASSWORD
+    routerusername = settings.USERNAME
+    routerpassword = settings.PASSWORD
     port = settings.PORT
 
-    connection = routeros_api.RouterOsApiPool(ip,username,password,port,plaintext_login=True,use_ssl=False,ssl_verify=True,ssl_verify_hostname=True,ssl_context=None,)
+    connection = routeros_api.RouterOsApiPool(ip,routerusername,routerpassword,port,plaintext_login=True,use_ssl=False,ssl_verify=True,ssl_verify_hostname=True,ssl_context=None,)
     api = connection.get_api()
     users = api.get_resource('/ip/hotspot/user')
-    users.add(name=username, password=username, profile='default', limit_uptime =duration)
+    users.add(name=voucher_code, password=voucher_code, profile='default', limit_uptime =duration)
+    connection.disconnect()
 
-def reconnection(request, voucher_code):
+def reconnection_logic(voucher_code):
     try:
-        voucher = Voucher.objects.get(code=voucher_code, is_expired=False)
-        duration = voucher.duration
-        mikrotic_router_connection(voucher.code, duration)
-        return render(request, "success.html")
+        voucher = Voucher.objects.get(code = voucher_code)
     except Voucher.DoesNotExist:
-        return HttpResponse("Voucher not found or expired", status=404)
-    except Exception as e:
-        print("Error during reconnection:", e)
-        return HttpResponse("An error occurred", status=500)
+        return {"status":"error", "message":"Invalid vouchercode"}
     
+    
+    if voucher.has_expired():
+        voucher.is_expired = True
+        voucher.save()
+        return {"status":"error", "message":"Voucher has expired"}
+    
+    remaining_seconds = (voucher.valid_until - timezone.now()).total_seconds()
+    mikrotic_router_connection(voucher_code,str(int(remaining_seconds)))
+
+    return {"status":"success", "message":"Reconnected successfully"}
+
+
+@csrf_exempt
+def reconnect_user(request):
+    if request.method == 'POST':
+        voucher_code = request.POST.get('voucher_code')
+        result = reconnection_logic(voucher_code)
+        return JsonResponse(result)
+    else:
+        return JsonResponse({"status":"error", "message":"Invalid request method"}, status=405)
+
+
       
 
 

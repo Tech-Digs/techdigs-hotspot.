@@ -11,6 +11,9 @@ urlpatterns = [
     path('', views.index, name='index'),
     path('confirm/<int:package_id>/', views.confirms, name='confirm'),
     path('payment/<int:package_id>/',views.mpesa_payment, name='payment'),
-    path('callback/', views.callback,name='callback'), 
+    path('callback/<int:package_id>', views.callback,name='callback'), 
+    path('check_payment/<str:checkout_id>/', views.check_payment_status, name='check_payment_status'),
+    path('success/', views.payment_success, name='payment_success'),
+    path('reconnection/<str>:voucher_code/',views.reconnection,name='reconnection')
     
 ]
